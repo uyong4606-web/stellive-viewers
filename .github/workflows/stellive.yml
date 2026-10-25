@@ -1,0 +1,287 @@
+# 스텔라이브 치지직 시청자 자동 수집
+# - 약 10분마다: 15명의 실시간 시청자 수를 치지직 공개 API에서 가져와 data/raw/ 에 기록
+# - 매일 09:07 KST: 전날 방송분 리포트를 reports/ 와 data/*_daily.csv 로 생성
+# 수동 실행: Actions 탭 → stellive-viewers → Run workflow (task에 collect 또는 report)
+name: stellive-viewers
+
+on:
+  schedule:
+    - cron: '3-59/10 * * * *'   # 수집 (UTC 기준, 10분 간격)
+    - cron: '7 0 * * *'         # 리포트 (00:07 UTC = 09:07 KST)
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'collect 또는 report'
+        default: 'collect'
+      date:
+        description: '리포트 방송일 YYYY-MM-DD (비우면 어제)'
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stellive
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Seoul
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 채널 목록
+        run: |
+          cat > channels.txt <<'EOF'
+          45e71a76e949e16a34764deb962f9d9f|아야츠노 유니
+          36ddb9bb4f17593b60f1b63cec86611d|사키하네 후야
+          4515b179f86b67b4981e16190817c580|네네코 마시로
+          4325b1d5bbc321fad3042306646e2e50|아카네 리제
+          a6c4ddb09cdb160478996007bff35296|아라하시 타비
+          b044e3a3b9259246bc92e863e7d3f3b8|시라유키 히나
+          64d76089fba26b180d9c9e48a32600d9|텐코 시부키
+          8fd39bb8de623317de90654718638b10|유즈하 리코
+          516937b5f85cbf2249ce31b0ad046b0f|아오쿠모 린
+          4d812b586ff63f8a2946e64fa860bbf5|하나코 나나
+          c657aa3592260a2b59669a72ec151936|코가네 랑
+          49d2c3cf8f0b2843d934ec15e82bb54c|하나요 히요리
+          2299fad4bebb504b0978e1ec08b2f7d3|시즈키 토아
+          792acf9ca28b42918710327e14b06b68|토키노 메리
+          b5ed5db484d04faf4d150aedd362f34b|강지
+          EOF
+
+      - name: 수집
+        if: github.event.schedule == '3-59/10 * * * *' || (github.event_name == 'workflow_dispatch' && inputs.task == 'collect')
+        run: |
+          mkdir -p data/raw
+          now=$(date +%s); stamp=$(date '+%F %T'); day=$(date +%F)
+          out="data/raw/$day.csv"
+          [ -f "$out" ] || echo 'epoch,시각,channelId,이름,상태,동시시청자,카테고리,방송시작' > "$out"
+          fails=0
+          while IFS='|' read -r cid name; do
+            [ -z "$cid" ] && continue
+            j=$(curl -sS -m 15 -A "Mozilla/5.0" "https://api.chzzk.naver.com/polling/v2/channels/$cid/live-status" || true)
+            row=$(echo "$j" | jq -r '.content | [(.status // "ERR"), (.concurrentUserCount // 0), ((.liveCategoryValue // "") | gsub(","; " ")), (.openDate // "")] | @csv' 2>/dev/null || true)
+            if [ -z "$row" ] || [ "${row%%,*}" = '"ERR"' ]; then row='"ERR",0,"",""'; fails=$((fails+1)); fi
+            echo "$now,$stamp,$cid,$name,$row" >> "$out"
+          done < channels.txt
+          echo "수집 실패 $fails / 15"
+          [ "$fails" -lt 15 ] || { echo "치지직 API에 접속하지 못했습니다"; exit 1; }
+
+      - name: 리포트
+        if: github.event.schedule == '7 0 * * *' || (github.event_name == 'workflow_dispatch' && inputs.task == 'report')
+        env:
+          REPORT_DATE: ${{ inputs.date }}
+        run: |
+          node <<'JS'
+          const fs = require('fs'), path = require('path');
+          const io = {
+            read: p => fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '',
+            write: (p, s) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, s); },
+          };
+          // 스텔라이브 치지직 일일 리포트 (GitHub Actions에서 Node로 실행)
+          // 집계 구간: 방송일 09:00 ~ 다음날 09:00 KST (자정 넘는 방송 포함)
+          // io = { read(path) -> string ('' if missing), write(path, string) }
+          const MAX_GAP = 900;   // 수집 간격이 이보다 길면 빈 구간으로 취급(초)
+          const NOMINAL = 600;   // 정상 수집 간격(초)
+
+          const pad = n => String(n).padStart(2, '0');
+          const ymd = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+          const parseYmd = s => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
+          const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+          const comma = n => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+          const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+
+          function parseCsvLine(line) {
+            const out = []; let cur = '', q = false;
+            for (let i = 0; i < line.length; i++) {
+              const c = line[i];
+              if (q) { if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+              else if (c === '"') q = true;
+              else if (c === ',') { out.push(cur); cur = ''; }
+              else cur += c;
+            }
+            out.push(cur);
+            return out;
+          }
+          function readCsv(io, p) {
+            const lines = io.read(p).replace(/^﻿/, '').split('\n').filter(l => l.trim());
+            if (!lines.length) return [];
+            const head = parseCsvLine(lines[0]);
+            return lines.slice(1).map(l => { const f = parseCsvLine(l); const o = {}; head.forEach((h, i) => o[h] = f[i]); return o; });
+          }
+          function writeCsv(io, p, head, rows) {
+            const cell = v => /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+            io.write(p, '﻿' + [head, ...rows.map(r => head.map(h => r[h]))].map(r => r.map(cell).join(',')).join('\n') + '\n');
+          }
+
+          function main(io, dateArg) {
+            const day = dateArg ? parseYmd(dateArg) : addDays(new Date(), -1);
+            const dayStr = ymd(day);
+            const start = new Date(day.getFullYear(), day.getMonth(), day.getDate(), 9).getTime() / 1000;
+            const end = start + 86400;
+
+            const names = io.read('channels.txt').split('\n').filter(l => l.includes('|')).map(l => l.split('|')[1].trim());
+
+            // 원본 읽기 (방송일, 다음날 파일)
+            const rows = [...readCsv(io, `data/raw/${dayStr}.csv`), ...readCsv(io, `data/raw/${ymd(addDays(day, 1))}.csv`)]
+              .filter(r => +r.epoch >= start && +r.epoch < end);
+            const runs = [...new Set(rows.map(r => +r.epoch))].sort((a, b) => a - b);
+            const weight = {};
+            runs.forEach((t, i) => { weight[t] = Math.min((i + 1 < runs.length ? runs[i + 1] : Math.min(end, t + NOMINAL)) - t, MAX_GAP); });
+            const coverage = runs.reduce((s, t) => s + weight[t], 0) / 86400;
+            // 수집 시작 전 날짜 등 데이터가 거의 없으면 기록을 남기지 않음 (0명으로 잘못 기록되는 것 방지)
+            if (coverage < 0.05) return `${dayStr} 건너뜀 · 수집률 ${(coverage * 100).toFixed(1)}% (데이터 부족)`;
+
+            // 개인 집계
+            const per = {}; names.forEach(n => per[n] = { w: 0, vw: 0, max: 0, cats: {} });
+            const runTotal = {}; runs.forEach(t => runTotal[t] = 0);
+            for (const r of rows) {
+              if (r['상태'] !== 'OPEN' || !per[r['이름']]) continue;
+              const v = +r['동시시청자'], w = weight[+r.epoch], p = per[r['이름']];
+              p.w += w; p.vw += v * w; p.max = Math.max(p.max, v);
+              if (r['카테고리']) p.cats[r['카테고리']] = (p.cats[r['카테고리']] || 0) + w;
+              runTotal[+r.epoch] += v;
+            }
+            const totalVH = names.reduce((s, n) => s + per[n].vw, 0) / 3600;
+            const today = names.map(n => {
+              const p = per[n];
+              const cat = Object.entries(p.cats).sort((a, b) => b[1] - a[1]).map(e => e[0]).slice(0, 2).join(', ');
+              return {
+                '날짜': dayStr, '이름': n,
+                '방송시간(h)': (p.w / 3600).toFixed(1),
+                '평균 시청자': p.w ? Math.round(p.vw / p.w) : 0,
+                '최고 시청자': p.max,
+                '뷰어십': Math.round(p.vw / 3600),
+                '점유율(%)': totalVH ? (p.vw / 3600 / totalVH * 100).toFixed(1) : '0.0',
+                '주 카테고리': cat,
+              };
+            });
+            const sumW = runs.reduce((s, t) => s + weight[t], 0);
+            const totalRow = {
+              '날짜': dayStr,
+              '총 뷰어십': Math.round(totalVH),
+              '합산 동시 최고': runs.reduce((m, t) => Math.max(m, runTotal[t]), 0),
+              '합산 평균(24h)': sumW ? Math.round(runs.reduce((s, t) => s + runTotal[t] * weight[t], 0) / sumW) : 0,
+              '방송 인원': today.filter(r => +r['방송시간(h)'] > 0).length,
+              '수집률(%)': (coverage * 100).toFixed(0),
+            };
+
+            // 누적 기록 갱신 (같은 날짜는 덮어씀)
+            const PH = ['날짜', '이름', '방송시간(h)', '평균 시청자', '최고 시청자', '뷰어십', '점유율(%)', '주 카테고리'];
+            const TH = ['날짜', '총 뷰어십', '합산 동시 최고', '합산 평균(24h)', '방송 인원', '수집률(%)'];
+            const personHist = readCsv(io, 'data/person_daily.csv').filter(r => r['날짜'] !== dayStr).concat(today)
+              .sort((a, b) => a['날짜'] < b['날짜'] ? -1 : a['날짜'] > b['날짜'] ? 1 : names.indexOf(a['이름']) - names.indexOf(b['이름']));
+            const totalHist = readCsv(io, 'data/total_daily.csv').filter(r => r['날짜'] !== dayStr).concat([totalRow])
+              .sort((a, b) => a['날짜'] < b['날짜'] ? -1 : 1);
+            writeCsv(io, 'data/person_daily.csv', PH, personHist);
+            writeCsv(io, 'data/total_daily.csv', TH, totalHist);
+
+            // 전일 비교
+            const prevStr = ymd(addDays(day, -1));
+            const prev = {}; personHist.filter(r => r['날짜'] === prevStr).forEach(r => prev[r['이름']] = r);
+            const prevTotal = totalHist.find(r => r['날짜'] === prevStr);
+
+            const html = buildHtml(dayStr, today, totalRow, prev, prevTotal, personHist, totalHist, names);
+            io.write(`reports/daily/${dayStr}.html`, html);
+            io.write('reports/latest.html', html);
+            return `${dayStr} 리포트 완료 · 수집률 ${totalRow['수집률(%)']}% · 방송 ${totalRow['방송 인원']}명 · 총 뷰어십 ${comma(totalRow['총 뷰어십'])}`;
+          }
+
+          function delta(cur, prev, kind) {
+            if (prev === undefined || prev === null || prev === '') return '<span class="d">–</span>';
+            cur = +cur; prev = +prev;
+            if (kind === 'pp') {
+              const d = cur - prev; if (Math.abs(d) < 0.05) return '<span class="d">0.0%p</span>';
+              return `<span class="${d > 0 ? 'up' : 'dn'}">${d > 0 ? '▲' : '▼'} ${Math.abs(d).toFixed(1)}%p</span>`;
+            }
+            if (!prev) return cur ? '<span class="d">전일 휴방</span>' : '<span class="d">–</span>';
+            const pct = (cur - prev) / prev * 100;
+            if (Math.abs(pct) < 0.05) return '<span class="d">0%</span>';
+            return `<span class="${pct > 0 ? 'up' : 'dn'}">${pct > 0 ? '▲' : '▼'} ${Math.abs(pct).toFixed(1)}%</span>`;
+          }
+
+          function buildHtml(dayStr, today, total, prev, prevTotal, personHist, totalHist, names) {
+            const live = today.filter(r => +r['방송시간(h)'] > 0).sort((a, b) => b['뷰어십'] - a['뷰어십']);
+            const off = today.filter(r => +r['방송시간(h)'] === 0);
+            const rowsHtml = live.map((r, i) => {
+              const p = prev[r['이름']] || {};
+              return `<tr><td class="c">${i + 1}</td><td class="n">${esc(r['이름'])}</td><td class="cat">${esc(r['주 카테고리'])}</td>
+          <td>${r['방송시간(h)']}h</td>
+          <td>${comma(r['평균 시청자'])}<br>${delta(r['평균 시청자'], p['평균 시청자'])}</td>
+          <td>${comma(r['최고 시청자'])}<br>${delta(r['최고 시청자'], p['최고 시청자'])}</td>
+          <td>${comma(r['뷰어십'])}<br>${delta(r['뷰어십'], p['뷰어십'])}</td>
+          <td><div class="bar"><i style="width:${Math.min(100, r['점유율(%)'] * 2)}%"></i></div>${r['점유율(%)']}%<br>${delta(r['점유율(%)'], p['점유율(%)'], 'pp')}</td></tr>`;
+            }).join('\n') + off.map(r => `<tr class="off"><td class="c">–</td><td class="n">${esc(r['이름'])}</td><td colspan="6">휴방</td></tr>`).join('\n');
+
+            // 최근 7일 점유율 / 평균 시청자 추이
+            const days = [...new Set(personHist.map(r => r['날짜']))].sort().slice(-7);
+            const lookup = {}; personHist.forEach(r => lookup[r['날짜'] + '|' + r['이름']] = r);
+            const trendHead = days.map(d => `<th>${d.slice(5)}</th>`).join('');
+            const trend = key => names.map(n => `<tr><td class="n">${esc(n)}</td>${days.map(d => {
+              const r = lookup[d + '|' + n]; if (!r || +r['방송시간(h)'] === 0) return '<td class="d">휴방</td>';
+              return `<td>${key === '점유율(%)' ? r[key] + '%' : comma(r[key])}</td>`;
+            }).join('')}</tr>`).join('\n');
+            const totals = totalHist.slice(-30).reverse().map(r => `<tr><td>${r['날짜']}</td><td>${comma(r['총 뷰어십'])}</td><td>${comma(r['합산 동시 최고'])}</td><td>${comma(r['합산 평균(24h)'])}</td><td>${r['방송 인원']}명</td><td>${r['수집률(%)']}%</td></tr>`).join('\n');
+            const pt = prevTotal || {};
+            const warn = +total['수집률(%)'] < 95 ? `<p class="warn">⚠ 수집률 ${total['수집률(%)']}% — 수집이 빠진 시간이 있어 일부 수치가 실제보다 낮을 수 있어요.</p>` : '';
+
+            return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>스텔라이브 시청자 리포트 ${dayStr}</title><style>
+          :root{--bg:#f6f7f9;--card:#fff;--ink:#16181d;--mute:#6b7280;--line:#e5e7eb;--up:#d92d20;--dn:#1570ef;--acc:#7c5cff}
+          @media (prefers-color-scheme:dark){:root{--bg:#111318;--card:#1a1d24;--ink:#eceef2;--mute:#9aa1ad;--line:#2a2f39;--up:#ff6b5e;--dn:#5ea0ff;--acc:#9b85ff}}
+          body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,"Apple SD Gothic Neo",sans-serif}
+          main{max-width:1100px;margin:0 auto;padding:24px 16px 48px}
+          h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:32px 0 10px}.sub{color:var(--mute);margin:0 0 20px}
+          .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+          .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+          .card b{display:block;font-size:22px;margin:2px 0}.card small{color:var(--mute)}
+          .wrap{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:12px}
+          table{border-collapse:collapse;width:100%;white-space:nowrap}
+          th,td{padding:9px 12px;border-bottom:1px solid var(--line);text-align:right;vertical-align:top}
+          th{font-size:12px;color:var(--mute);font-weight:600;background:var(--card);position:sticky;top:0}
+          td.n,th.n{text-align:left;font-weight:600}td.c{text-align:center;color:var(--mute)}td.cat{text-align:left;color:var(--mute);font-size:12px;max-width:180px;overflow:hidden;text-overflow:ellipsis}
+          tr:last-child td{border-bottom:0}tr.off td{color:var(--mute)}tr.off td[colspan]{text-align:left}
+          .up{color:var(--up);font-size:12px}.dn{color:var(--dn);font-size:12px}.d{color:var(--mute);font-size:12px}
+          .bar{height:4px;background:var(--line);border-radius:2px;margin:6px 0 4px;width:90px;margin-left:auto}.bar i{display:block;height:100%;background:var(--acc);border-radius:2px}
+          .warn{background:#fff4e5;color:#8a4b00;border-radius:8px;padding:10px 12px}@media (prefers-color-scheme:dark){.warn{background:#3a2a10;color:#ffcf8a}}
+          .note{color:var(--mute);font-size:12px;margin-top:24px}
+          </style></head><body><main>
+          <h1>스텔라이브 치지직 시청자 리포트</h1>
+          <p class="sub">방송일 ${dayStr} · 집계 구간 ${dayStr} 09:00 ~ 다음날 09:00 · 수집률 ${total['수집률(%)']}%</p>
+          ${warn}
+          <div class="cards">
+          <div class="card"><small>총 뷰어십 (시청자×시간)</small><b>${comma(total['총 뷰어십'])}</b>${delta(total['총 뷰어십'], pt['총 뷰어십'])}</div>
+          <div class="card"><small>합산 동시 최고</small><b>${comma(total['합산 동시 최고'])}</b>${delta(total['합산 동시 최고'], pt['합산 동시 최고'])}</div>
+          <div class="card"><small>합산 평균 (24시간)</small><b>${comma(total['합산 평균(24h)'])}</b>${delta(total['합산 평균(24h)'], pt['합산 평균(24h)'])}</div>
+          <div class="card"><small>방송한 인원</small><b>${total['방송 인원']} / ${names.length}명</b><span class="d">전일 ${pt['방송 인원'] ?? '–'}명</span></div>
+          </div>
+          <h2>개인별 (뷰어십 순) — 아래 작은 글씨는 전일 대비</h2>
+          <div class="wrap"><table><thead><tr><th>#</th><th class="n">이름</th><th class="n">카테고리</th><th>방송시간</th><th>평균 시청자</th><th>최고 시청자</th><th>뷰어십</th><th>점유율</th></tr></thead><tbody>
+          ${rowsHtml}
+          </tbody></table></div>
+          <h2>최근 7일 점유율</h2>
+          <div class="wrap"><table><thead><tr><th class="n">이름</th>${trendHead}</tr></thead><tbody>${trend('점유율(%)')}</tbody></table></div>
+          <h2>최근 7일 평균 시청자</h2>
+          <div class="wrap"><table><thead><tr><th class="n">이름</th>${trendHead}</tr></thead><tbody>${trend('평균 시청자')}</tbody></table></div>
+          <h2>스텔라이브 전체 기록 (최근 30일)</h2>
+          <div class="wrap"><table><thead><tr><th>방송일</th><th>총 뷰어십</th><th>합산 동시 최고</th><th>합산 평균(24h)</th><th>방송 인원</th><th>수집률</th></tr></thead><tbody>${totals}</tbody></table></div>
+          <p class="note">출처: 치지직 공개 API를 GitHub Actions로 약 10분마다 수집 · 평균 시청자 = 방송 중 동시 시청자의 시간 가중 평균 · 뷰어십 = 동시 시청자 × 방송 시간(시간 단위) · 점유율 = 스텔라이브 15명 뷰어십 합계 대비 비중 · 합산 동시 최고 = 같은 시각 15명 동시 시청자 합의 최댓값</p>
+          </main></body></html>`;
+          }
+          console.log(main(io, process.env.REPORT_DATE || ''));
+          JS
+
+      - name: 저장
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A data $( [ -d reports ] && echo reports )
+          git diff --cached --quiet && exit 0
+          git commit -q -m "update $(date '+%F %H:%M')"
+          for i in 1 2 3; do git pull -q --rebase && git push -q && exit 0; sleep 5; done
+          exit 1
