@@ -1,13 +1,15 @@
 # 스텔라이브 치지직 시청자 자동 수집
-# - 약 10분마다: 15명의 실시간 시청자 수를 치지직 공개 API에서 가져와 data/raw/ 에 기록
-# - 매일 09:07 KST: 전날 방송분 리포트(reports/daily, latest)와 전체 기록 표(reports/history.html), data/*_daily.csv 생성
+# - 수집: 한 번 실행되면 약 55분 동안 2분마다 15명의 실시간 시청자 수를 data/raw/ 에 기록
+#   (GitHub 예약 실행은 30~40분씩 늦어지기 때문에, 실행 하나가 길게 돌며 빈틈을 메움)
+#   실행 중에 들어온 예약은 하나만 대기하고 나머지는 자동 취소됨 → Actions 목록의 '취소됨'은 정상
+# - 리포트: 매일 09:20 KST 무렵 전날 방송분 리포트(reports/daily, latest), 전체 기록 표(reports/history.html), data/*_daily.csv 생성
 # 수동 실행: Actions 탭 → stellive-viewers → Run workflow (task에 collect 또는 report)
 name: stellive-viewers
 
 on:
   schedule:
-    - cron: '3-59/10 * * * *'   # 수집 (UTC 기준, 10분 간격)
-    - cron: '7 0 * * *'         # 리포트 (00:07 UTC = 09:07 KST)
+    - cron: '3-59/10 * * * *'   # 수집 시작 (UTC 기준)
+    - cron: '20 0 * * *'        # 리포트 (00:20 UTC = 09:20 KST)
   workflow_dispatch:
     inputs:
       task:
@@ -20,17 +22,18 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: stellive
-  cancel-in-progress: false
-
 env:
   TZ: Asia/Seoul
+  SAMPLE_SECONDS: 300   # 수집 간격(초). 5분이면 300, 15분이면 900 — 이 숫자만 바꾸면 됨
 
 jobs:
-  run:
+  collect:
+    if: github.event.schedule == '3-59/10 * * * *' || (github.event_name == 'workflow_dispatch' && inputs.task == 'collect')
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 60
+    concurrency:
+      group: stellive-collect
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
         with:
@@ -56,26 +59,83 @@ jobs:
           b5ed5db484d04faf4d150aedd362f34b|강지
           EOF
 
-      - name: 수집
-        if: github.event.schedule == '3-59/10 * * * *' || (github.event_name == 'workflow_dispatch' && inputs.task == 'collect')
+      - name: 수집 (약 55분 동안 2분마다)
         run: |
-          mkdir -p data/raw
-          now=$(date +%s); stamp=$(date '+%F %T'); day=$(date +%F)
-          out="data/raw/$day.csv"
-          [ -f "$out" ] || echo 'epoch,시각,channelId,이름,상태,동시시청자,카테고리,방송시작' > "$out"
-          fails=0
-          while IFS='|' read -r cid name; do
-            [ -z "$cid" ] && continue
-            j=$(curl -sS -m 15 -A "Mozilla/5.0" "https://api.chzzk.naver.com/polling/v2/channels/$cid/live-status" || true)
-            row=$(echo "$j" | jq -r '.content | [(.status // "ERR"), (.concurrentUserCount // 0), ((.liveCategoryValue // "") | gsub(","; " ")), (.openDate // "")] | @csv' 2>/dev/null || true)
-            if [ -z "$row" ] || [ "${row%%,*}" = '"ERR"' ]; then row='"ERR",0,"",""'; fails=$((fails+1)); fi
-            echo "$now,$stamp,$cid,$name,$row" >> "$out"
-          done < channels.txt
-          echo "수집 실패 $fails / 15"
-          [ "$fails" -lt 15 ] || { echo "치지직 API에 접속하지 못했습니다"; exit 1; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          collect_once() {
+            mkdir -p data/raw
+            local now stamp day out fails j row
+            now=$(date +%s); stamp=$(date '+%F %T'); day=$(date +%F)
+            out="data/raw/$day.csv"
+            [ -f "$out" ] || echo 'epoch,시각,channelId,이름,상태,동시시청자,카테고리,방송시작' > "$out"
+            fails=0
+            while IFS='|' read -r cid name; do
+              [ -z "$cid" ] && continue
+              j=$(curl -sS -m 15 -A "Mozilla/5.0" "https://api.chzzk.naver.com/polling/v2/channels/$cid/live-status" || true)
+              # 방송 중(OPEN)이 아니면 동시시청자는 0으로 기록 (치지직은 방송이 끝나도 마지막 숫자를 그대로 돌려줌)
+              row=$(echo "$j" | jq -r '.content | [(.status // "ERR"), (if .status == "OPEN" then (.concurrentUserCount // 0) else 0 end), ((.liveCategoryValue // "") | gsub(","; " ")), (.openDate // "")] | @csv' 2>/dev/null || true)
+              if [ -z "$row" ] || [ "${row%%,*}" = '"ERR"' ]; then row='"ERR",0,"",""'; fails=$((fails+1)); fi
+              echo "$now,$stamp,$cid,$name,$row" >> "$out"
+            done < channels.txt
+            echo "$stamp 수집 (실패 $fails / 15)"
+          }
+
+          save() {
+            git add -A data
+            git diff --cached --quiet && return 0
+            git commit -q -m "update $(date '+%F %H:%M')"
+            for i in 1 2 3 4 5; do git pull -q --rebase && git push -q && return 0; sleep 5; done
+            echo "저장 실패"; return 1
+          }
+
+          every=${SAMPLE_SECONDS:-120}
+          save_every=$(( 600 / every )); [ "$save_every" -lt 1 ] && save_every=1   # 약 10분마다 중간 저장
+          end=$(( $(date +%s) + 54 * 60 ))
+          n=0
+          while :; do
+            collect_once || true
+            n=$((n + 1))
+            [ $((n % save_every)) -eq 0 ] && { save || true; }
+            [ $(( $(date +%s) + every - $(date +%s) % every )) -ge "$end" ] && break   # 다음 수집이 끝 시각을 넘으면 종료
+            sleep $(( every - $(date +%s) % every ))      # 다음 간격 정각까지 대기
+          done
+          save
+
+  report:
+    if: github.event.schedule == '20 0 * * *' || (github.event_name == 'workflow_dispatch' && inputs.task == 'report')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: stellive-report
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: 채널 목록
+        run: |
+          cat > channels.txt <<'EOF'
+          45e71a76e949e16a34764deb962f9d9f|아야츠노 유니
+          36ddb9bb4f17593b60f1b63cec86611d|사키하네 후야
+          4515b179f86b67b4981e16190817c580|네네코 마시로
+          4325b1d5bbc321fad3042306646e2e50|아카네 리제
+          a6c4ddb09cdb160478996007bff35296|아라하시 타비
+          b044e3a3b9259246bc92e863e7d3f3b8|시라유키 히나
+          64d76089fba26b180d9c9e48a32600d9|텐코 시부키
+          8fd39bb8de623317de90654718638b10|유즈하 리코
+          516937b5f85cbf2249ce31b0ad046b0f|아오쿠모 린
+          4d812b586ff63f8a2946e64fa860bbf5|하나코 나나
+          c657aa3592260a2b59669a72ec151936|코가네 랑
+          49d2c3cf8f0b2843d934ec15e82bb54c|하나요 히요리
+          2299fad4bebb504b0978e1ec08b2f7d3|시즈키 토아
+          792acf9ca28b42918710327e14b06b68|토키노 메리
+          b5ed5db484d04faf4d150aedd362f34b|강지
+          EOF
 
       - name: 리포트
-        if: github.event.schedule == '7 0 * * *' || (github.event_name == 'workflow_dispatch' && inputs.task == 'report')
         env:
           REPORT_DATE: ${{ inputs.date }}
         run: |
@@ -88,8 +148,7 @@ jobs:
           // 스텔라이브 치지직 일일 리포트 (GitHub Actions에서 Node로 실행)
           // 집계 구간: 방송일 09:00 ~ 다음날 09:00 KST (자정 넘는 방송 포함)
           // io = { read(path) -> string ('' if missing), write(path, string) }
-          const MAX_GAP = 900;   // 수집 간격이 이보다 길면 빈 구간으로 취급(초)
-          const NOMINAL = 600;   // 정상 수집 간격(초)
+          // 수집 간격(초)은 워크플로의 SAMPLE_SECONDS 값을 받아 씀. 간격의 2.5배(최소 5분)보다 벌어지면 빈 구간으로 취급
 
           const pad = n => String(n).padStart(2, '0');
           const ymd = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -121,7 +180,10 @@ jobs:
             io.write(p, '﻿' + [head, ...rows.map(r => head.map(h => r[h]))].map(r => r.map(cell).join(',')).join('\n') + '\n');
           }
 
-          function main(io, dateArg) {
+          function main(io, dateArg, sampleSeconds) {
+            const NOMINAL = +sampleSeconds > 0 ? +sampleSeconds : 120;
+            const MAX_GAP = Math.max(300, NOMINAL * 2.5);
+            const everyText = NOMINAL % 60 ? `${NOMINAL}초마다` : `${NOMINAL / 60}분마다`;
             const day = dateArg ? parseYmd(dateArg) : addDays(new Date(), -1);
             const dayStr = ymd(day);
             const start = new Date(day.getFullYear(), day.getMonth(), day.getDate(), 9).getTime() / 1000;
@@ -188,7 +250,7 @@ jobs:
             const prev = {}; personHist.filter(r => r['날짜'] === prevStr).forEach(r => prev[r['이름']] = r);
             const prevTotal = totalHist.find(r => r['날짜'] === prevStr);
 
-            const html = buildHtml(dayStr, today, totalRow, prev, prevTotal, personHist, totalHist, names);
+            const html = buildHtml(dayStr, today, totalRow, prev, prevTotal, personHist, totalHist, names, everyText);
             io.write(`reports/daily/${dayStr}.html`, html);
             io.write('reports/latest.html', html);
             io.write('reports/history.html', buildHistoryHtml(personHist, totalHist, names));
@@ -208,7 +270,7 @@ jobs:
             return `<span class="${pct > 0 ? 'up' : 'dn'}">${pct > 0 ? '▲' : '▼'} ${Math.abs(pct).toFixed(1)}%</span>`;
           }
 
-          function buildHtml(dayStr, today, total, prev, prevTotal, personHist, totalHist, names) {
+          function buildHtml(dayStr, today, total, prev, prevTotal, personHist, totalHist, names, everyText) {
             const live = today.filter(r => +r['방송시간(h)'] > 0).sort((a, b) => b['뷰어십'] - a['뷰어십']);
             const off = today.filter(r => +r['방송시간(h)'] === 0);
             const rowsHtml = live.map((r, i) => {
@@ -273,7 +335,7 @@ jobs:
           <div class="wrap"><table><thead><tr><th class="n">이름</th>${trendHead}</tr></thead><tbody>${trend('평균 시청자')}</tbody></table></div>
           <h2>스텔라이브 전체 기록 (최근 30일)</h2>
           <div class="wrap"><table><thead><tr><th>방송일</th><th>총 뷰어십</th><th>합산 동시 최고</th><th>합산 평균(24h)</th><th>방송 인원</th><th>수집률</th></tr></thead><tbody>${totals}</tbody></table></div>
-          <p class="note">출처: 치지직 공개 API를 GitHub Actions로 약 10분마다 수집 · 평균 시청자 = 방송 중 동시 시청자의 시간 가중 평균 · 뷰어십 = 동시 시청자 × 방송 시간(시간 단위) · 점유율 = 스텔라이브 15명 뷰어십 합계 대비 비중 · 합산 동시 최고 = 같은 시각 15명 동시 시청자 합의 최댓값</p>
+          <p class="note">출처: 치지직 공개 API를 GitHub Actions로 ${everyText} 수집 · 평균 시청자 = 방송 중 동시 시청자의 시간 가중 평균 · 뷰어십 = 동시 시청자 × 방송 시간(시간 단위) · 점유율 = 스텔라이브 15명 뷰어십 합계 대비 비중 · 합산 동시 최고 = 같은 시각 15명 동시 시청자 합의 최댓값</p>
           </main></body></html>`;
           }
 
@@ -430,7 +492,7 @@ jobs:
           render();
           </script></body></html>`;
           }
-          console.log(main(io, process.env.REPORT_DATE || ''));
+          console.log(main(io, process.env.REPORT_DATE || '', process.env.SAMPLE_SECONDS));
           JS
 
       - name: 저장
@@ -439,6 +501,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A data $( [ -d reports ] && echo reports )
           git diff --cached --quiet && exit 0
-          git commit -q -m "update $(date '+%F %H:%M')"
-          for i in 1 2 3; do git pull -q --rebase && git push -q && exit 0; sleep 5; done
+          git commit -q -m "report $(date '+%F %H:%M')"
+          for i in 1 2 3 4 5; do git pull -q --rebase && git push -q && exit 0; sleep 5; done
           exit 1
