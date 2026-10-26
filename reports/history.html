@@ -1,0 +1,145 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>스텔라이브 시청자 전체 기록</title><style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#16181d;--mute:#6b7280;--line:#e5e7eb;--up:#d92d20;--dn:#1570ef;--acc:#7c5cff}
+@media (prefers-color-scheme:dark){:root{--bg:#111318;--card:#1a1d24;--ink:#eceef2;--mute:#9aa1ad;--line:#2a2f39;--up:#ff6b5e;--dn:#5ea0ff;--acc:#9b85ff}}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,"Apple SD Gothic Neo",sans-serif}
+main{max-width:1280px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:32px 0 10px}.sub{color:var(--mute);margin:0 0 16px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 16px}
+.seg{display:inline-flex;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:3px;gap:2px;flex-wrap:wrap}
+.seg button{border:0;background:transparent;color:var(--mute);font:inherit;font-size:13px;padding:6px 12px;border-radius:7px;cursor:pointer}
+.seg button.on{background:var(--acc);color:#fff;font-weight:600}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.card b{display:block;font-size:22px;margin:2px 0}.card small{color:var(--mute)}
+.wrap{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:12px}
+table{border-collapse:separate;border-spacing:0;width:100%;white-space:nowrap}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:right}
+th{font-size:12px;color:var(--mute);font-weight:600;background:var(--card);cursor:pointer;user-select:none}
+th a{color:inherit;text-decoration:none}th a:hover{text-decoration:underline}
+th.sorted{color:var(--ink)}
+td.n,th.n{text-align:left;font-weight:600;position:sticky;left:0;background:var(--card);z-index:1}
+td.n a{color:var(--acc);text-decoration:none}td.n a:hover{text-decoration:underline}
+td.off{color:var(--mute);font-size:12px}
+td.sum,th.sum{border-left:2px solid var(--line);font-weight:600}
+tr:last-child td{border-bottom:0}
+.up{color:var(--up)}.dn{color:var(--dn)}.d{color:var(--mute)}
+.mini{display:inline-block;height:6px;border-radius:3px;background:var(--acc);vertical-align:middle;margin-right:6px;opacity:.7}
+.note{color:var(--mute);font-size:12px;margin-top:24px}
+</style></head><body><main>
+<h1>스텔라이브 치지직 시청자 전체 기록</h1>
+<p class="sub" id="span"></p>
+<div class="bar">
+<div class="seg" id="metric"></div>
+<div class="seg" id="range"></div>
+</div>
+<div class="cards" id="cards"></div>
+<h2 id="pivotTitle"></h2>
+<div class="wrap"><table id="pivot"></table></div>
+<h2>날짜별 스텔라이브 전체</h2>
+<div class="wrap"><table id="totals"></table></div>
+<p class="note">날짜를 누르면 그날 리포트가 열립니다 · 표 머리글을 누르면 정렬 · 칸 색이 진할수록 큰 값 · 기간 요약: 평균 시청자는 방송 시간 가중 평균, 최고 시청자는 기간 최댓값, 뷰어십·방송시간은 합계, 점유율은 기간 뷰어십 합계 기준 · 출처: 치지직 공개 API</p>
+</main>
+<script id="data" type="application/json">{"names":["아야츠노 유니","사키하네 후야","네네코 마시로","아카네 리제","아라하시 타비","시라유키 히나","텐코 시부키","유즈하 리코","아오쿠모 린","하나코 나나","코가네 랑","하나요 히요리","시즈키 토아","토키노 메리","강지"],"person":[["2026-10-25","아야츠노 유니",0.8,7220,9557,6016,1],["2026-10-25","사키하네 후야",9.2,2706,3825,24802,4.3],["2026-10-25","네네코 마시로",0,0,0,0,0],["2026-10-25","아카네 리제",9.1,4639,7673,42137,7.3],["2026-10-25","아라하시 타비",0,0,0,0,0],["2026-10-25","시라유키 히나",0,0,0,0,0],["2026-10-25","텐코 시부키",7.8,4027,4661,31544,5.4],["2026-10-25","유즈하 리코",9.3,4413,7173,41190,7.1],["2026-10-25","아오쿠모 린",7.8,3394,5987,26303,4.5],["2026-10-25","하나코 나나",9.4,4611,8361,43229,7.5],["2026-10-25","코가네 랑",10.1,4371,6841,44069,7.6],["2026-10-25","하나요 히요리",6.8,16110,19833,108743,18.8],["2026-10-25","시즈키 토아",11.5,9683,15675,111356,19.2],["2026-10-25","토키노 메리",5.2,15354,18785,79331,13.7],["2026-10-25","강지",8.9,2368,6513,21110,3.6]],"total":[["2026-10-25",579830,70686,29173,12,83]]}</script>
+<script>
+var D = JSON.parse(document.getElementById('data').textContent);
+var METRICS = [
+  { i: 3, label: '평균 시청자' }, { i: 4, label: '최고 시청자' }, { i: 5, label: '뷰어십' },
+  { i: 6, label: '점유율', pct: true }, { i: 2, label: '방송시간', hours: true }
+];
+var RANGES = [{ n: 7, label: '최근 7일' }, { n: 14, label: '최근 14일' }, { n: 30, label: '최근 30일' }, { n: 0, label: '전체' }];
+var state = { metric: 0, range: 1, sort: 'sum', asc: false };
+try { var saved = JSON.parse(localStorage.getItem('stellive-history') || 'null'); if (saved) { state.metric = saved.metric; state.range = saved.range; } } catch (e) {}
+
+function comma(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function fmt(v, m) { return m.pct ? v.toFixed(1) + '%' : m.hours ? v.toFixed(1) + 'h' : comma(v); }
+var WD = '일월화수목금토';
+function label(d) { var p = d.split('-'); var w = WD[new Date(+p[0], +p[1] - 1, +p[2]).getDay()]; return +p[1] + '/' + +p[2] + ' (' + w + ')'; }
+function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+
+var allDates = Array.from(new Set(D.total.map(function (r) { return r[0]; }))).sort();
+var cell = {}; D.person.forEach(function (r) { cell[r[0] + '|' + r[1]] = r; });
+var tot = {}; D.total.forEach(function (r) { tot[r[0]] = r; });
+
+function seg(id, items, key) {
+  var el = document.getElementById(id); el.innerHTML = '';
+  items.forEach(function (it, k) {
+    var b = document.createElement('button'); b.textContent = it.label; if (state[key] === k) b.className = 'on';
+    b.onclick = function () { state[key] = k; state.sort = 'sum'; state.asc = false; try { localStorage.setItem('stellive-history', JSON.stringify({ metric: state.metric, range: state.range })); } catch (e) {} render(); };
+    el.appendChild(b);
+  });
+}
+
+function summary(name, dates, m) {
+  var h = 0, vh = 0, mx = 0, days = 0, totVh = 0;
+  dates.forEach(function (d) {
+    var r = cell[d + '|' + name]; if (tot[d]) totVh += tot[d][1];
+    if (!r || r[2] === 0) return; days++; h += r[2]; vh += r[5]; mx = Math.max(mx, r[4]);
+  });
+  var v = m.i === 3 ? (h ? vh / h : 0) : m.i === 4 ? mx : m.i === 5 ? vh : m.i === 6 ? (totVh ? vh / totVh * 100 : 0) : h;
+  return { v: v, days: days };
+}
+
+function render() {
+  seg('metric', METRICS, 'metric'); seg('range', RANGES, 'range');
+  var m = METRICS[state.metric], n = RANGES[state.range].n;
+  var dates = n ? allDates.slice(-n) : allDates.slice();
+  var prevDates = n ? allDates.slice(-2 * n, -n) : [];
+  document.getElementById('span').textContent = dates.length ? '기간 ' + dates[0] + ' ~ ' + dates[dates.length - 1] + ' · ' + dates.length + '일치 기록' : '아직 기록이 없어요';
+
+  // 요약 카드
+  var sumVh = 0, prevVh = 0, best = null, avgSum = 0;
+  dates.forEach(function (d) { var t = tot[d]; sumVh += t[1]; avgSum += t[3]; if (!best || t[2] > tot[best][2]) best = d; });
+  prevDates.forEach(function (d) { prevVh += tot[d][1]; });
+  var chg = prevDates.length === dates.length && prevVh ? (sumVh - prevVh) / prevVh * 100 : null;
+  var chgHtml = chg === null ? '<span class="d">직전 기간 기록 없음</span>' : '<span class="' + (chg >= 0 ? 'up' : 'dn') + '">' + (chg >= 0 ? '▲ ' : '▼ ') + Math.abs(chg).toFixed(1) + '% (직전 같은 기간 대비)</span>';
+  document.getElementById('cards').innerHTML = dates.length ? [
+    '<div class="card"><small>기간 총 뷰어십</small><b>' + comma(sumVh) + '</b>' + chgHtml + '</div>',
+    '<div class="card"><small>하루 평균 뷰어십</small><b>' + comma(sumVh / dates.length) + '</b><span class="d">' + dates.length + '일 평균</span></div>',
+    '<div class="card"><small>하루 평균 합산 시청자 (24h)</small><b>' + comma(avgSum / dates.length) + '</b></div>',
+    '<div class="card"><small>최고 합산 동시 시청자</small><b>' + comma(tot[best][2]) + '</b><span class="d">' + label(best) + '</span></div>'
+  ].join('') : '';
+
+  // 개인 × 날짜 표
+  document.getElementById('pivotTitle').textContent = '멤버별 ' + m.label + ' (날짜별)';
+  var rows = D.names.map(function (name) {
+    var vals = dates.map(function (d) { var r = cell[d + '|' + name]; return r && r[2] > 0 ? r[m.i] : null; });
+    var s = summary(name, dates, m);
+    return { name: name, vals: vals, sum: s.v, days: s.days };
+  });
+  var key = state.sort;
+  rows.sort(function (a, b) {
+    var x = key === 'sum' ? a.sum : key === 'days' ? a.days : key === 'name' ? 0 : (a.vals[key] === null ? -1 : a.vals[key]);
+    var y = key === 'sum' ? b.sum : key === 'days' ? b.days : key === 'name' ? 0 : (b.vals[key] === null ? -1 : b.vals[key]);
+    if (key === 'name') return state.asc ? a.name.localeCompare(b.name) : D.names.indexOf(a.name) - D.names.indexOf(b.name);
+    return state.asc ? x - y : y - x;
+  });
+  var max = 0; rows.forEach(function (r) { r.vals.forEach(function (v) { if (v !== null && v > max) max = v; }); });
+  var sumLabel = m.i === 3 ? '기간 평균' : m.i === 4 ? '기간 최고' : m.i === 6 ? '기간 점유율' : '기간 합계';
+  function th(k, html, cls) { return '<th data-k="' + k + '" class="' + (cls || '') + (state.sort === String(k) ? ' sorted' : '') + '">' + html + (state.sort === String(k) ? (state.asc ? ' ▲' : ' ▼') : '') + '</th>'; }
+  var head = '<thead><tr>' + th('name', '이름', 'n') + dates.map(function (d, k) { return th(k, '<a href="daily/' + d + '.html" onclick="event.stopPropagation()">' + label(d) + '</a>'); }).join('') + th('sum', sumLabel, 'sum') + th('days', '방송일') + '</tr></thead>';
+  var body = rows.map(function (r) {
+    return '<tr><td class="n">' + esc(r.name) + '</td>' + r.vals.map(function (v) {
+      if (v === null) return '<td class="off">휴방</td>';
+      var a = max ? Math.round(8 + 42 * Math.sqrt(v / max)) : 0;
+      return '<td style="background:color-mix(in srgb,var(--acc) ' + a + '%,transparent)">' + fmt(v, m) + '</td>';
+    }).join('') + '<td class="sum">' + (r.days ? fmt(r.sum, m) : '–') + '</td><td>' + r.days + '/' + dates.length + '</td></tr>';
+  }).join('');
+  var pv = document.getElementById('pivot'); pv.innerHTML = head + '<tbody>' + body + '</tbody>';
+  pv.querySelectorAll('th').forEach(function (h) {
+    h.onclick = function () { var k = h.getAttribute('data-k'); if (state.sort === k) state.asc = !state.asc; else { state.sort = k; state.asc = k === 'name'; } render(); };
+  });
+
+  // 날짜별 전체 표 (최신이 위)
+  var tmax = 0; dates.forEach(function (d) { tmax = Math.max(tmax, tot[d][1]); });
+  document.getElementById('totals').innerHTML = '<thead><tr><th class="n">날짜</th><th>총 뷰어십</th><th>전일 대비</th><th>합산 동시 최고</th><th>합산 평균(24h)</th><th>방송 인원</th><th>수집률</th></tr></thead><tbody>' +
+    dates.slice().reverse().map(function (d) {
+      var t = tot[d], i = allDates.indexOf(d), p = i > 0 ? tot[allDates[i - 1]] : null;
+      var c = p && p[1] ? (t[1] - p[1]) / p[1] * 100 : null;
+      return '<tr><td class="n"><a href="daily/' + d + '.html">' + label(d) + '</a></td><td><span class="mini" style="width:' + Math.round(60 * t[1] / (tmax || 1)) + 'px"></span>' + comma(t[1]) + '</td><td>' +
+        (c === null ? '<span class="d">–</span>' : '<span class="' + (c >= 0 ? 'up' : 'dn') + '">' + (c >= 0 ? '▲ ' : '▼ ') + Math.abs(c).toFixed(1) + '%</span>') +
+        '</td><td>' + comma(t[2]) + '</td><td>' + comma(t[3]) + '</td><td>' + t[4] + '명</td><td' + (t[5] < 95 ? ' class="up"' : '') + '>' + t[5] + '%</td></tr>';
+    }).join('') + '</tbody>';
+}
+render();
+</script></body></html>
