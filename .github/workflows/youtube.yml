@@ -1,0 +1,745 @@
+# 스텔라이브 유튜브 조회수·구독자 자동 수집 (회사 맥 youtube_tracker.py를 클라우드로 옮긴 것)
+# - 수집(run): 3시간마다. 새 업로드 확인, 올라온 지 72시간 안 된 영상 조회수 기록,
+#   하루 첫 실행(00:40 KST 무렵)에 모든 영상 조회수와 채널 구독자·총조회수 기록
+# - 리포트(report): 매일 09:10 KST 무렵. youtube/reports/youtube/날짜.md·.html, youtube/data/*.csv
+# - 필요한 것: 저장소 Settings → Secrets and variables → Actions 에 YT_API_KEY (유튜브 API 키)
+# 수동 실행: Actions 탭 → youtube → Run workflow (task에 run, report, check, quota)
+name: youtube
+
+on:
+  schedule:
+    - cron: '40 */3 * * *'   # 수집 (UTC 기준 3시간마다 = KST 00:40, 03:40, ...)
+    - cron: '10 0 * * *'     # 리포트 (00:10 UTC = 09:10 KST)
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'run, report, check, quota 중 하나'
+        default: 'run'
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Seoul
+
+concurrency:
+  group: stellive-youtube   # 수집과 리포트가 동시에 돌지 않게 순서대로
+  cancel-in-progress: false
+
+jobs:
+  youtube:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main   # 예전 실행을 다시 돌려도 항상 최신 데이터에서 시작
+
+      - name: 스크립트 준비
+        run: |
+          mkdir -p youtube
+          cat > youtube/youtube_tracker.py <<'PY_TRACKER'
+          #!/usr/bin/env python3
+          """스텔라이브 유튜브 영상 조회수 트래커 (YouTube Data API v3).
+
+          run    : 3시간마다 실행. 새 업로드를 찾고, 올라온 지 72시간 이내 영상의
+                   조회수를 기록한다. 하루 첫 실행 때는 모든 영상과 채널 통계를 기록한다.
+          report : 매일 09:10 실행. 채널별 구독자·조회수 증가와 최근 7일 업로드 영상의
+                   24시간/72시간/7일 조회수를 정리하고 CSV로 내보낸다.
+          quota  : 오늘 쓴 API 할당량을 보여준다.
+          check  : 채널 설정을 확인한다(핸들 → 채널 ID 변환 결과 출력).
+
+          무료 할당량은 하루 10,000단위(미국 태평양 시간 자정 초기화)이고,
+          이 스크립트는 하루 수백 단위 정도를 쓴다. 검색 API(100단위)는 쓰지 않는다.
+          """
+          import argparse
+          import csv
+          import json
+          import os
+          import re
+          import sqlite3
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from collections import defaultdict
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          KST = ZoneInfo("Asia/Seoul")
+          PT = ZoneInfo("America/Los_Angeles")
+          BASE = Path(__file__).resolve().parent
+          DATA = BASE / "data"
+          REPORTS = BASE / "reports" / "youtube"
+          DB_PATH = DATA / "youtube.db"
+          CHANNELS_PATH = BASE / "yt_channels.json"
+          SETTINGS_PATH = BASE / "settings.json"
+          CHANNEL_CSV = DATA / "yt_channel_daily.csv"
+          VIDEOS_CSV = DATA / "yt_videos.csv"
+
+          API = "https://www.googleapis.com/youtube/v3/"
+          RECENT_HOURS = 78          # 이 시간 안의 새 영상은 실행할 때마다 기록(72시간 + 여유)
+          DAILY_CAP = 8000           # 무료 10,000단위 중 여유를 남긴 자체 한도
+          SHORTS_MAX_SEC = 180       # 3분 이하를 쇼츠로 추정
+          COVER_WORDS = ("cover", "커버", "歌ってみた")
+          # (시간, CSV 열 이름, 허용 오차 시간): 기준 시각 이후 첫 기록을 쓴다
+          MILESTONES = [(24, "views_24h", 3.5), (72, "views_72h", 3.5),
+                        (168, "views_7d", 24), (720, "views_30d", 24)]
+
+          CHANNEL_FIELDS = ["date", "name", "group", "kind", "subscribers",
+                            "sub_gain", "total_views", "view_gain", "video_count",
+                            "uploads_24h"]
+          VIDEO_FIELDS = ["video_id", "name", "kind", "vtype", "title", "published",
+                          "duration_sec"] + [m[1] for m in MILESTONES] + \
+                         ["latest_views", "latest_likes", "latest_comments",
+                          "latest_at", "url"]
+
+
+          class QuotaError(Exception):
+              pass
+
+
+          def now_kst():
+              return datetime.now(KST)
+
+
+          def stamp(dt):
+              return dt.astimezone(KST).replace(second=0, microsecond=0).isoformat()
+
+
+          # ---------- 저장소 ----------
+
+          def db():
+              DATA.mkdir(exist_ok=True)
+              conn = sqlite3.connect(DB_PATH)
+              conn.executescript("""
+              CREATE TABLE IF NOT EXISTS channels (
+                  key TEXT PRIMARY KEY, channel_id TEXT, name TEXT, grp TEXT,
+                  kind TEXT, title TEXT, uploads TEXT);
+              CREATE TABLE IF NOT EXISTS videos (
+                  video_id TEXT PRIMARY KEY, channel_id TEXT, title TEXT,
+                  published TEXT, duration_sec INTEGER, vtype TEXT);
+              CREATE TABLE IF NOT EXISTS video_stats (
+                  ts TEXT, video_id TEXT, views INTEGER, likes INTEGER,
+                  comments INTEGER, PRIMARY KEY (ts, video_id));
+              CREATE TABLE IF NOT EXISTS channel_stats (
+                  ts TEXT, channel_id TEXT, subscribers INTEGER, views INTEGER,
+                  video_count INTEGER, PRIMARY KEY (ts, channel_id));
+              CREATE TABLE IF NOT EXISTS quota (day TEXT PRIMARY KEY, units INTEGER);
+              CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+              CREATE INDEX IF NOT EXISTS vs_video ON video_stats(video_id, ts);
+              """)
+              return conn
+
+
+          def meta_get(conn, key):
+              row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+              return row[0] if row else None
+
+
+          def meta_set(conn, key, value):
+              conn.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
+
+
+          # ---------- API ----------
+
+          def load_settings():
+              # 클라우드(GitHub Actions)에서는 저장소 비밀값 YT_API_KEY를 쓴다
+              if os.environ.get("YT_API_KEY", "").strip():
+                  return os.environ["YT_API_KEY"].strip()
+              if not SETTINGS_PATH.exists():
+                  sys.exit("settings.json이 없습니다. settings.example.json을 복사해 "
+                           "API 키를 넣어 주세요.")
+              key = json.loads(SETTINGS_PATH.read_text(encoding="utf-8")).get("api_key")
+              if not key or key.startswith("여기에"):
+                  sys.exit("settings.json에 API 키를 넣어 주세요.")
+              return key
+
+
+          def quota_day():
+              return datetime.now(PT).date().isoformat()
+
+
+          def quota_used(conn):
+              row = conn.execute("SELECT units FROM quota WHERE day=?",
+                                 (quota_day(),)).fetchone()
+              return row[0] if row else 0
+
+
+          def api_get(conn, key, endpoint, params):
+              if quota_used(conn) + 1 > DAILY_CAP:
+                  raise QuotaError("자체 한도 도달")
+              query = urllib.parse.urlencode({**params, "key": key})
+              try:
+                  with urllib.request.urlopen(f"{API}{endpoint}?{query}",
+                                              timeout=20) as resp:
+                      data = json.loads(resp.read().decode("utf-8"))
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", "ignore")
+                  if e.code == 403 and "quota" in body.lower():
+                      raise QuotaError("유튜브 할당량 초과") from e
+                  raise
+              finally:
+                  conn.execute("INSERT INTO quota VALUES (?,1) ON CONFLICT(day) "
+                               "DO UPDATE SET units=units+1", (quota_day(),))
+                  conn.commit()
+              return data
+
+
+          def chunks(items, n=50):
+              for i in range(0, len(items), n):
+                  yield items[i:i + n]
+
+
+          # ---------- 채널 ----------
+
+          def load_channel_config(warn=False):
+              entries = json.loads(CHANNELS_PATH.read_text(encoding="utf-8"))
+              usable, missing = [], []
+              for e in entries:
+                  if e.get("channel_id") or e.get("handle"):
+                      e["key"] = e.get("channel_id") or e["handle"]
+                      usable.append(e)
+                  else:
+                      missing.append(f"{e['name']}({e['kind']})")
+              if missing and warn:
+                  print(f"[경고] 핸들/채널 ID가 비어 있어 건너뜀: {', '.join(missing)}",
+                        file=sys.stderr)
+              return usable
+
+
+          def resolve_channels(conn, key, warn=False):
+              """설정의 핸들·채널 ID를 실제 채널과 업로드 재생목록으로 바꿔 저장한다."""
+              out = []
+              for e in load_channel_config(warn):
+                  row = conn.execute("SELECT channel_id, uploads FROM channels "
+                                     "WHERE key=?", (e["key"],)).fetchone()
+                  if not row:
+                      params = {"part": "snippet,contentDetails"}
+                      if e.get("channel_id"):
+                          params["id"] = e["channel_id"]
+                      else:
+                          params["forHandle"] = e["handle"]
+                      items = api_get(conn, key, "channels", params).get("items") or []
+                      if not items:
+                          print(f"[오류] 채널을 찾지 못함: {e['name']}({e['kind']}) "
+                                f"{e['key']}", file=sys.stderr)
+                          continue
+                      it = items[0]
+                      row = (it["id"],
+                             it["contentDetails"]["relatedPlaylists"]["uploads"])
+                      conn.execute("INSERT OR REPLACE INTO channels VALUES "
+                                   "(?,?,?,?,?,?,?)",
+                                   (e["key"], row[0], e["name"], e.get("group", ""),
+                                    e["kind"], it["snippet"]["title"], row[1]))
+                      conn.commit()
+                  out.append({**e, "channel_id": row[0], "uploads": row[1]})
+              return out
+
+
+          # ---------- 영상 ----------
+
+          def parse_duration(iso):
+              m = re.fullmatch(r"P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?",
+                               iso or "")
+              if not m:
+                  return 0
+              d, h, mi, s = (int(x or 0) for x in m.groups())
+              return d * 86400 + h * 3600 + mi * 60 + s
+
+
+          def classify(title, seconds, kind):
+              if kind == "다시보기":
+                  return "다시보기"
+              low = (title or "").lower()
+              if any(w in low for w in COVER_WORDS):
+                  return "커버"
+              if 0 < seconds <= SHORTS_MAX_SEC:
+                  return "쇼츠(추정)"
+              return "일반"
+
+
+          def sync_uploads(conn, key, ch):
+              """업로드 목록을 최신순으로 읽다가 이미 아는 영상을 만나면 멈춘다."""
+              known = {r[0] for r in conn.execute(
+                  "SELECT video_id FROM videos WHERE channel_id=?",
+                  (ch["channel_id"],))}
+              new_ids, token = [], None
+              while True:
+                  params = {"part": "contentDetails", "playlistId": ch["uploads"],
+                            "maxResults": 50}
+                  if token:
+                      params["pageToken"] = token
+                  data = api_get(conn, key, "playlistItems", params)
+                  hit_known = False
+                  for it in data.get("items") or []:
+                      vid = it["contentDetails"]["videoId"]
+                      if vid in known:
+                          hit_known = True
+                          break
+                      new_ids.append(vid)
+                  token = data.get("nextPageToken")
+                  if hit_known or not token:
+                      break
+              for batch in chunks(new_ids):
+                  data = api_get(conn, key, "videos",
+                                 {"part": "snippet,contentDetails",
+                                  "id": ",".join(batch)})
+                  for it in data.get("items") or []:
+                      sec = parse_duration(it["contentDetails"].get("duration"))
+                      title = it["snippet"]["title"]
+                      pub = datetime.fromisoformat(
+                          it["snippet"]["publishedAt"].replace("Z", "+00:00"))
+                      conn.execute("INSERT OR REPLACE INTO videos VALUES (?,?,?,?,?,?)",
+                                   (it["id"], ch["channel_id"], title, stamp(pub), sec,
+                                    classify(title, sec, ch["kind"])))
+              conn.commit()
+              return len(new_ids)
+
+
+          def snapshot_videos(conn, key, video_ids, ts):
+              for batch in chunks(list(video_ids)):
+                  data = api_get(conn, key, "videos",
+                                 {"part": "statistics", "id": ",".join(batch)})
+                  for it in data.get("items") or []:
+                      st = it.get("statistics") or {}
+                      conn.execute("INSERT OR REPLACE INTO video_stats VALUES "
+                                   "(?,?,?,?,?)",
+                                   (ts, it["id"], int(st.get("viewCount", 0)),
+                                    int(st.get("likeCount", 0)),
+                                    int(st.get("commentCount", 0))))
+              conn.commit()
+
+
+          def snapshot_channels(conn, key, channels, ts):
+              ids = list({c["channel_id"] for c in channels})
+              for batch in chunks(ids):
+                  data = api_get(conn, key, "channels",
+                                 {"part": "statistics", "id": ",".join(batch)})
+                  for it in data.get("items") or []:
+                      st = it.get("statistics") or {}
+                      conn.execute("INSERT OR REPLACE INTO channel_stats VALUES "
+                                   "(?,?,?,?,?)",
+                                   (ts, it["id"], int(st.get("subscriberCount", 0)),
+                                    int(st.get("viewCount", 0)),
+                                    int(st.get("videoCount", 0))))
+              conn.commit()
+
+
+          # ---------- 명령: run ----------
+
+          def cmd_run(_args):
+              key = load_settings()
+              conn = db()
+              now = now_kst()
+              ts = stamp(now)
+              try:
+                  channels = resolve_channels(conn, key)
+                  if not channels:
+                      print("[경고] 설정된 채널이 없습니다. yt_channels.json을 "
+                            "채우고 check 명령으로 확인하세요.", file=sys.stderr)
+                      return
+                  new_total = sum(sync_uploads(conn, key, ch) for ch in channels)
+                  recent_from = stamp(now - timedelta(hours=RECENT_HOURS))
+                  recent = [r[0] for r in conn.execute(
+                      "SELECT video_id FROM videos WHERE published >= ?",
+                      (recent_from,))]
+                  snapshot_videos(conn, key, recent, ts)
+                  full = ""
+                  if meta_get(conn, "last_full") != now.date().isoformat():
+                      rest = [r[0] for r in conn.execute(
+                          "SELECT video_id FROM videos WHERE published < ?",
+                          (recent_from,))]
+                      snapshot_videos(conn, key, rest, ts)
+                      snapshot_channels(conn, key, channels, ts)
+                      meta_set(conn, "last_full", now.date().isoformat())
+                      conn.commit()
+                      full = f", 전체 기록 {len(rest) + len(recent)}개"
+                  print(f"{ts} 새 영상 {new_total}개, 최근 영상 기록 {len(recent)}개"
+                        f"{full}, 오늘 할당량 {quota_used(conn)}단위")
+              except QuotaError as e:
+                  print(f"[중단] {e}. 다음 실행 때 이어서 합니다.", file=sys.stderr)
+              finally:
+                  conn.close()
+
+
+          # ---------- 명령: report ----------
+
+          def read_csv(path):
+              if not path.exists():
+                  return []
+              with open(path, encoding="utf-8-sig", newline="") as f:
+                  return list(csv.DictReader(f))
+
+
+          def write_csv(path, fields, rows):
+              with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader()
+                  w.writerows(rows)
+
+
+          def milestones_for(snaps, published):
+              """snaps: [(ts, views)] 시간순. 기준 시각 직후 기록을 마일스톤 값으로 쓴다."""
+              pub = datetime.fromisoformat(published)
+              out = {}
+              for hours, col, tol in MILESTONES:
+                  target = pub + timedelta(hours=hours)
+                  out[col] = ""
+                  for ts, views in snaps:
+                      t = datetime.fromisoformat(ts)
+                      if t >= target:
+                          if t - target <= timedelta(hours=tol):
+                              out[col] = views
+                          break
+              return out
+
+
+          def fmt(n):
+              return f"{int(n):,}" if n not in ("", None) else "—"
+
+
+          def cmd_report(_args):
+              conn = db()
+              today = now_kst().date().isoformat()
+              chans = conn.execute(
+                  "SELECT channel_id, name, grp, kind FROM channels ORDER BY grp, name, "
+                  "CASE kind WHEN '본채널' THEN 0 WHEN '다시보기' THEN 1 ELSE 2 END"
+              ).fetchall()
+              info = {c[0]: c for c in chans}
+
+              # 채널 통계: 가장 최근 기록과 그 직전 기록을 비교
+              channel_rows = []
+              since_24h = stamp(now_kst() - timedelta(hours=24))
+              for cid, name, grp, kind in chans:
+                  stats = conn.execute(
+                      "SELECT ts, subscribers, views, video_count FROM channel_stats "
+                      "WHERE channel_id=? ORDER BY ts DESC LIMIT 2", (cid,)).fetchall()
+                  if not stats:
+                      continue
+                  cur = stats[0]
+                  prev = stats[1] if len(stats) > 1 else None
+                  uploads = conn.execute(
+                      "SELECT COUNT(*) FROM videos WHERE channel_id=? AND published>=?",
+                      (cid, since_24h)).fetchone()[0]
+                  channel_rows.append({
+                      "date": today, "name": name, "group": grp, "kind": kind,
+                      "subscribers": cur[1],
+                      "sub_gain": cur[1] - prev[1] if prev else "",
+                      "total_views": cur[2],
+                      "view_gain": cur[2] - prev[2] if prev else "",
+                      "video_count": cur[3], "uploads_24h": uploads})
+
+              old = [r for r in read_csv(CHANNEL_CSV) if r["date"] != today]
+              write_csv(CHANNEL_CSV, CHANNEL_FIELDS, old + channel_rows)
+
+              # 영상별 마일스톤과 최신 조회수
+              video_rows = []
+              for vid, cid, title, pub, sec, vtype in conn.execute(
+                      "SELECT video_id, channel_id, title, published, duration_sec, "
+                      "vtype FROM videos ORDER BY published DESC").fetchall():
+                  snaps = conn.execute(
+                      "SELECT ts, views, likes, comments FROM video_stats "
+                      "WHERE video_id=? ORDER BY ts", (vid,)).fetchall()
+                  last = snaps[-1] if snaps else ("", "", "", "")
+                  c = info.get(cid, (cid, "", "", ""))
+                  video_rows.append({
+                      "video_id": vid, "name": c[1], "kind": c[3], "vtype": vtype,
+                      "title": title, "published": pub[:16].replace("T", " "),
+                      "duration_sec": sec,
+                      **milestones_for([(s[0], s[1]) for s in snaps], pub),
+                      "latest_views": last[1], "latest_likes": last[2],
+                      "latest_comments": last[3],
+                      "latest_at": last[0][:16].replace("T", " "),
+                      "url": f"https://youtu.be/{vid}"})
+              write_csv(VIDEOS_CSV, VIDEO_FIELDS, video_rows)
+              conn.close()
+
+              # 마크다운 리포트
+              REPORTS.mkdir(parents=True, exist_ok=True)
+              lines = [f"# 스텔라이브 유튜브 일일 리포트 — {today}", "",
+                       "## 채널 현황 (직전 기록 대비)", "",
+                       "| 채널 | 구분 | 구독자 | 증감 | 늘어난 조회수 | 24시간 업로드 |",
+                       "| --- | --- | --- | --- | --- | --- |"]
+              for r in channel_rows:
+                  gain = f"{int(r['sub_gain']):+,}" if r["sub_gain"] != "" else "—"
+                  name = f"**{r['name']}**" if r["name"] == "하나코 나나" else r["name"]
+                  lines.append(f"| {name} | {r['kind']} | {fmt(r['subscribers'])} | "
+                               f"{gain} | {fmt(r['view_gain'])} | {r['uploads_24h']} |")
+              lines += ["", "구독자 수는 유튜브가 반올림해 공개하므로 작은 변화는 "
+                        "잡히지 않습니다.", "",
+                        "## 최근 7일 업로드", "",
+                        "| 채널 | 유형 | 제목 | 업로드 | 24시간 | 72시간 | 7일 | 현재 |",
+                        "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+              week_ago = (now_kst() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+              for v in video_rows:
+                  if v["published"] < week_ago:
+                      break
+                  title = v["title"] if len(v["title"]) <= 32 else v["title"][:31] + "…"
+                  title = title.replace("|", "／")
+                  label = v["name"] + (" 다시보기" if v["kind"] == "다시보기" else "")
+                  lines.append(
+                      f"| {label} | {v['vtype']} | {title} | {v['published'][5:]} | "
+                      f"{fmt(v['views_24h'])} | {fmt(v['views_72h'])} | "
+                      f"{fmt(v['views_7d'])} | {fmt(v['latest_views'])} |")
+              path = REPORTS / f"{today}.md"
+              path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+              print(f"리포트 작성: {path}")
+
+
+          # ---------- 명령: quota / check ----------
+
+          def cmd_quota(_args):
+              conn = db()
+              print(f"오늘(태평양 시간 {quota_day()}) 사용: {quota_used(conn)}단위 "
+                    f"/ 자체 한도 {DAILY_CAP} / 무료 한도 10,000")
+
+
+          def cmd_check(_args):
+              key = load_settings()
+              conn = db()
+              for ch in resolve_channels(conn, key, warn=True):
+                  title = conn.execute("SELECT title FROM channels WHERE key=?",
+                                       (ch["key"],)).fetchone()[0]
+                  print(f"{ch['name']:<10} {ch['kind']:<5} → {title} "
+                        f"({ch['channel_id']})")
+              print(f"오늘 사용 할당량: {quota_used(conn)}단위")
+
+
+          def main():
+              p = argparse.ArgumentParser(description="스텔라이브 유튜브 조회수 트래커")
+              sub = p.add_subparsers(dest="cmd", required=True)
+              for name, func in [("run", cmd_run), ("report", cmd_report),
+                                 ("quota", cmd_quota), ("check", cmd_check)]:
+                  sub.add_parser(name).set_defaults(func=func)
+              args = p.parse_args()
+              args.func(args)
+
+
+          if __name__ == "__main__":
+              main()
+          PY_TRACKER
+          cat > youtube/ytdb.py <<'PY_DB'
+          #!/usr/bin/env python3
+          """youtube.db <-> 텍스트(CSV) 보관소.
+
+          GitHub에 sqlite 파일을 3시간마다 통째로 올리면 저장소가 금방 무거워지므로,
+          실행 전에 store/의 CSV로 db를 만들고(load), 실행 뒤 다시 CSV로 내보낸다(dump).
+          영상별 기록(video_stats)은 월별 파일로 나눠서 지난달 파일은 더 바뀌지 않는다.
+          """
+          import csv
+          import sys
+          from pathlib import Path
+
+          import youtube_tracker as yt
+
+          STORE = yt.BASE / "store"
+          TABLES = {
+              "channels": ["key", "channel_id", "name", "grp", "kind", "title", "uploads"],
+              "videos": ["video_id", "channel_id", "title", "published", "duration_sec",
+                         "vtype"],
+              "channel_stats": ["ts", "channel_id", "subscribers", "views",
+                                "video_count"],
+              "quota": ["day", "units"],
+              "meta": ["key", "value"],
+          }
+          STATS = ["ts", "video_id", "views", "likes", "comments"]
+
+
+          def rows(path):
+              with open(path, encoding="utf-8", newline="") as f:
+                  r = csv.reader(f)
+                  next(r, None)
+                  yield from r
+
+
+          def insert(conn, table, cols, path):
+              marks = ",".join("?" * len(cols))
+              conn.executemany(f"INSERT OR REPLACE INTO {table} ({','.join(cols)}) "
+                               f"VALUES ({marks})", rows(path))
+
+
+          def load():
+              if yt.DB_PATH.exists():
+                  yt.DB_PATH.unlink()
+              conn = yt.db()
+              for table, cols in TABLES.items():
+                  path = STORE / f"{table}.csv"
+                  if path.exists():
+                      insert(conn, table, cols, path)
+              for path in sorted((STORE / "video_stats").glob("*.csv")):
+                  insert(conn, "video_stats", STATS, path)
+              conn.commit()
+              n = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+              print(f"불러옴: 영상 {n}개")
+              conn.close()
+
+
+          def write(path, cols, data):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              with open(path, "w", encoding="utf-8", newline="") as f:
+                  w = csv.writer(f, lineterminator="\n")
+                  w.writerow(cols)
+                  w.writerows(data)
+
+
+          def dump():
+              conn = yt.db()
+              for table, cols in TABLES.items():
+                  data = conn.execute(f"SELECT {','.join(cols)} FROM {table} "
+                                      f"ORDER BY {cols[0]}, {cols[1]}").fetchall()
+                  write(STORE / f"{table}.csv", cols, data)
+              months = [r[0] for r in conn.execute(
+                  "SELECT DISTINCT substr(ts,1,7) FROM video_stats")]
+              for m in months:
+                  data = conn.execute(f"SELECT {','.join(STATS)} FROM video_stats "
+                                      "WHERE substr(ts,1,7)=? ORDER BY ts, video_id",
+                                      (m,)).fetchall()
+                  write(STORE / "video_stats" / f"{m}.csv", STATS, data)
+              print(f"저장: {STORE}")
+              conn.close()
+
+
+          if __name__ == "__main__":
+              {"load": load, "dump": dump}[sys.argv[1]]()
+          PY_DB
+          cat > youtube/md2html.py <<'PY_HTML'
+          #!/usr/bin/env python3
+          """유튜브 일일 리포트(.md)를 맥에서 바로 열어 볼 수 있는 .html로 바꾼다."""
+          import html
+          import re
+          import sys
+          from pathlib import Path
+
+          CSS = """
+          :root{--bg:#fff;--fg:#1d1d1f;--sub:#6e6e73;--line:#e5e5ea;--head:#f5f5f7;--up:#0a7d3e;--down:#c4202b}
+          @media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--fg:#f2f2f7;--sub:#a1a1a6;--line:#3a3a3c;--head:#2c2c2e;--up:#4cd27a;--down:#ff6961}}
+          body{margin:0;padding:24px 16px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif}
+          main{max-width:1100px;margin:0 auto}h1{font-size:22px}h2{font-size:17px;margin-top:28px}
+          p{color:var(--sub);font-size:13px}.wrap{overflow-x:auto}
+          table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+          th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:right;white-space:nowrap}
+          th{background:var(--head);font-weight:600}th:first-child,td:first-child{text-align:left}
+          td.t{text-align:left;white-space:normal;min-width:220px}.up{color:var(--up)}.down{color:var(--down)}
+          """
+
+
+          def cell(text):
+              s = html.escape(text.strip())
+              s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+              cls = ""
+              if re.fullmatch(r"\+[\d,]+", s):
+                  cls = ' class="up"'
+              elif re.fullmatch(r"-[\d,]+", s):
+                  cls = ' class="down"'
+              return s, cls
+
+
+          def convert(md):
+              out, table, title = [], None, ""
+              for line in md.splitlines() + [""]:
+                  if line.startswith("|"):
+                      cells = line.strip().strip("|").split("|")
+                      if all(set(c.strip()) <= set("-: ") for c in cells):
+                          continue
+                      if table is None:
+                          table = ["<div class=wrap><table><tr>" + "".join(
+                              f"<th>{cell(c)[0]}</th>" for c in cells) + "</tr>"]
+                          title_col = [c.strip() for c in cells].index("제목") \
+                              if "제목" in [c.strip() for c in cells] else -1
+                      else:
+                          tds = []
+                          for i, c in enumerate(cells):
+                              s, cls = cell(c)
+                              tds.append(f'<td class="t">{s}</td>' if i == title_col
+                                         else f"<td{cls}>{s}</td>")
+                          table.append("<tr>" + "".join(tds) + "</tr>")
+                      continue
+                  if table is not None:
+                      out.append("".join(table) + "</table></div>")
+                      table = None
+                  if line.startswith("## "):
+                      out.append(f"<h2>{html.escape(line[3:])}</h2>")
+                  elif line.startswith("# "):
+                      title = line[2:]
+                      out.append(f"<h1>{html.escape(title)}</h1>")
+                  elif line.strip():
+                      out.append(f"<p>{cell(line)[0]}</p>")
+              return (f'<!doctype html><html lang="ko"><meta charset="utf-8">'
+                      f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+                      f"<title>{html.escape(title)}</title><style>{CSS}</style>"
+                      f"<main>{''.join(out)}</main></html>\n")
+
+
+          if __name__ == "__main__":
+              for p in map(Path, sys.argv[1:]):
+                  p.with_suffix(".html").write_text(convert(p.read_text("utf-8")),
+                                                    encoding="utf-8")
+                  print(f"HTML: {p.with_suffix('.html')}")
+          PY_HTML
+          cat > youtube/yt_channels.json <<'JSON_CH'
+          [
+            {"name": "아야츠노 유니", "group": "1기", "kind": "본채널", "handle": "@ayatsunoyuni", "channel_id": "UClbYIn9LDbbFZ9w2shX3K0g"},
+            {"name": "아야츠노 유니", "group": "1기", "kind": "다시보기", "handle": "@Yunireplay", "channel_id": "UCUj4JItmvebxPBfmGcJHsNQ"},
+            {"name": "사키하네 후야", "group": "1기", "kind": "본채널", "handle": "@Sakihanechannel", "channel_id": "UC0YQnenKBCu5sGb7H61n6HA"},
+            {"name": "사키하네 후야", "group": "1기", "kind": "다시보기", "handle": "@Sakihanereplay", "channel_id": "UCJz5aRHEMTL10zLfMj5hVmg"},
+            {"name": "네네코 마시로", "group": "2기", "kind": "본채널", "handle": "@neneko_mashiro", "channel_id": "UC_eeSpMBz8PG4ssdBPnP07g"},
+            {"name": "네네코 마시로", "group": "2기", "kind": "다시보기", "handle": "@mashiroreplay", "channel_id": "UCW3wobzj-JJE_TNs7ysJPiQ"},
+            {"name": "아카네 리제", "group": "2기", "kind": "본채널", "handle": "@akanelize", "channel_id": "UC7-m6jQLinZQWIbwm9W-1iw"},
+            {"name": "아카네 리제", "group": "2기", "kind": "다시보기", "handle": "@lizereplay", "channel_id": "UC5qsIJIixQI5k2FfkW1j1NQ"},
+            {"name": "아라하시 타비", "group": "2기", "kind": "본채널", "handle": "@arahashitabi", "channel_id": "UCAHVQ44O81aehLWfy9O6Elw"},
+            {"name": "아라하시 타비", "group": "2기", "kind": "다시보기", "handle": "@tabireplay", "channel_id": "UCOAD3RLV7uC3uc39ok7NLyg"},
+            {"name": "시라유키 히나", "group": "2기", "kind": "본채널", "handle": "@shirayukihina", "channel_id": "UC1afpiIuBDcjYlmruAa0HiA"},
+            {"name": "시라유키 히나", "group": "2기", "kind": "다시보기", "handle": "@hinareplay", "channel_id": "UCnnR7k28ItzN1GAYx2rQ1rw"},
+            {"name": "텐코 시부키", "group": "3기", "kind": "본채널", "handle": "@tenkoshibuki", "channel_id": "UCYxLMfeX1CbMBll9MsGlzmw"},
+            {"name": "텐코 시부키", "group": "3기", "kind": "다시보기", "handle": "@shibukireplay", "channel_id": "UCfoPMrULJvdKN8GlBZJwqHg"},
+            {"name": "유즈하 리코", "group": "3기", "kind": "본채널", "handle": "@yuzuhariko", "channel_id": "UCj0c1jUr91dTetIQP2pFeLA"},
+            {"name": "유즈하 리코", "group": "3기", "kind": "다시보기", "handle": "@rikoreplay", "channel_id": "UCVZcw2SMyL6h5CfKSCs42_A"},
+            {"name": "아오쿠모 린", "group": "3기", "kind": "본채널", "handle": "@aokumorin", "channel_id": "UCQmcltnre6aG9SkDRYZqFIg"},
+            {"name": "아오쿠모 린", "group": "3기", "kind": "다시보기", "handle": "@rinreplay", "channel_id": "UCmw0eKk5uOv029SScRRRfqw"},
+            {"name": "하나코 나나", "group": "3기", "kind": "본채널", "handle": "@hanako_nana", "channel_id": "UCcA21_PzN1EhNe7xS4MJGsQ"},
+            {"name": "하나코 나나", "group": "3기", "kind": "다시보기", "handle": "@nana_replay", "channel_id": "UCmmzr9DL0_t5ui1TAZjv-nA"},
+            {"name": "코가네 랑", "group": "4기", "kind": "본채널", "handle": "@coganerang", "channel_id": "UCQ6LlsI7Bbj2yhSqLMI1gGA"},
+            {"name": "코가네 랑", "group": "4기", "kind": "다시보기", "handle": "@Rangreplay", "channel_id": "UCc1rcuA00rW1S-SMOWgjl8Q"},
+            {"name": "하나요 히요리", "group": "4기", "kind": "본채널", "handle": "@HanayoHiyori", "channel_id": "UCHAr9pWGS30akL4MQCQT4uQ"},
+            {"name": "하나요 히요리", "group": "4기", "kind": "다시보기", "handle": "@Hiyorireplay", "channel_id": "UCLqOqHMtSF4qV30nm2fQdYw"},
+            {"name": "시즈키 토아", "group": "4기", "kind": "본채널", "handle": "@ShizukiToa", "channel_id": "UClcSEuDF_g_6g4snw_nAavw"},
+            {"name": "시즈키 토아", "group": "4기", "kind": "다시보기", "handle": "@Toareplay", "channel_id": "UCVtHg1HdM0QWInWH5QxUL3A"},
+            {"name": "토키노 메리", "group": "4기", "kind": "본채널", "handle": "@TokinoMaryChannel", "channel_id": "UCGSt1yNG5l-jpYRLpJ5oNtA"},
+            {"name": "토키노 메리", "group": "4기", "kind": "다시보기", "handle": "@Maryreplay", "channel_id": "UCsfl49B6oPk_l2sQ29NTCrg"},
+            {"name": "강지", "group": "대표", "kind": "본채널", "handle": "@GANGZI1", "channel_id": "UCIVFv8AiQLqM9oLHTixrNYw"},
+            {"name": "강지", "group": "대표", "kind": "다시보기", "handle": "@강지다시보기", "channel_id": "UC2Ki6__sICXPyHPCyFxIgbw"},
+            {"name": "스텔라이브 공식", "group": "공식", "kind": "공식", "handle": "@stellive_official", "channel_id": "UC2b4WRE5BZ6SIUWBeJU8rwg"}
+          ]
+          JSON_CH
+
+      - name: 실행
+        env:
+          YT_API_KEY: ${{ secrets.YT_API_KEY }}
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_TASK: ${{ inputs.task }}
+        run: |
+          if [ -z "$YT_API_KEY" ]; then
+            echo "::error::YT_API_KEY 비밀값이 없습니다. Settings → Secrets and variables → Actions 에서 추가하세요."; exit 1
+          fi
+          if [ "$EVENT" = workflow_dispatch ]; then task="$INPUT_TASK"
+          elif [ "$SCHEDULE" = '10 0 * * *' ]; then task=report
+          else task=run; fi
+          case "$task" in run|report|check|quota) ;; *) echo "::error::알 수 없는 task: $task"; exit 1;; esac
+          cd youtube
+          python3 ytdb.py load
+          python3 youtube_tracker.py "$task"
+          if [ "$task" = report ]; then python3 md2html.py "reports/youtube/$(date +%F).md"; fi
+          python3 ytdb.py dump
+
+      - name: 저장
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add youtube/store youtube/data/*.csv $( [ -d youtube/reports ] && echo youtube/reports )
+          git diff --cached --quiet && exit 0
+          git commit -q -m "youtube $(date '+%F %H:%M')"
+          for i in 1 2 3 4 5; do git pull -q --rebase && git push -q && exit 0; sleep 5; done
+          exit 1
