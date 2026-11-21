@@ -2,6 +2,12 @@
 # - 수집: 한 번 실행되면 약 55분 동안 2분마다 15명의 실시간 시청자 수를 data/raw/ 에 기록
 #   (GitHub 예약 실행은 30~40분씩 늦어지기 때문에, 실행 하나가 길게 돌며 빈틈을 메움)
 #   실행 중에 들어온 예약은 하나만 대기하고 나머지는 자동 취소됨 → Actions 목록의 '취소됨'은 정상
+#   (2026-11-21) GitHub 예약이 한 시간에 한 번꼴로만 켜져 실행 사이 5~35분이 비던 것을 막으려고,
+#   수집 실행이 시작하자마자 다음 수집 실행을 직접 예약(workflow_dispatch)해 둠 → 끝나는 즉시 다음 실행이 이어받음(이어달리기).
+#   예약(cron)은 이어달리기가 끊겼을 때 다시 잇는 예비용.
+# - 리포트의 빈 구간 채우기(2026-11-21): 3시간 이하로 빈 구간은 앞뒤 기록으로 채워 계산(같은 방송이면 앞뒤 값 사이 직선,
+#   빈 사이에 방송이 시작됐으면 시작 시각부터 뒤 값). '수집률'은 실제로 수집한 시간만 셈.
+#   지난 날짜 전부 다시 계산: Actions → stellive-viewers → Run workflow → task에 report, date에 all
 # - 리포트: 매일 09:20 KST 무렵 전날 방송분 리포트(reports/daily, latest), 전체 기록 표(reports/history.html), data/*_daily.csv 생성
 # 수동 실행: Actions 탭 → stellive-viewers → Run workflow (task에 collect 또는 report)
 name: stellive-viewers
@@ -16,11 +22,12 @@ on:
         description: 'collect 또는 report'
         default: 'collect'
       date:
-        description: '리포트 방송일 YYYY-MM-DD (비우면 어제)'
+        description: '리포트 방송일 YYYY-MM-DD (비우면 어제, all이면 지난 날짜 전부 다시 계산)'
         default: ''
 
 permissions:
   contents: write
+  actions: write   # 이어달리기: 수집 실행이 다음 수집 실행을 예약
 
 env:
   TZ: Asia/Seoul
@@ -58,6 +65,11 @@ jobs:
           792acf9ca28b42918710327e14b06b68|토키노 메리
           b5ed5db484d04faf4d150aedd362f34b|강지
           EOF
+
+      - name: 다음 수집 실행 미리 예약 (이어달리기)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run stellive.yml --repo "$GITHUB_REPOSITORY" --ref main -f task=collect || echo "다음 실행 예약 실패 — 예약(cron)이 이어받음"
 
       - name: 수집 (약 55분 동안 2분마다)
         run: |
@@ -192,12 +204,19 @@ jobs:
             const names = io.read('channels.txt').split('\n').filter(l => l.includes('|')).map(l => l.split('|')[1].trim());
 
             // 원본 읽기 (방송일, 다음날 파일)
-            const rows = [...readCsv(io, `data/raw/${dayStr}.csv`), ...readCsv(io, `data/raw/${ymd(addDays(day, 1))}.csv`)]
-              .filter(r => +r.epoch >= start && +r.epoch < end);
+            const raw = [...readCsv(io, `data/raw/${dayStr}.csv`), ...readCsv(io, `data/raw/${ymd(addDays(day, 1))}.csv`)];
+            const inDay = r => +r.epoch >= start && +r.epoch < end;
+            const wOf = list => { const w = {}; list.forEach((t, i) => { w[t] = Math.min((i + 1 < list.length ? list[i + 1] : Math.min(end, t + NOMINAL)) - t, MAX_GAP); }); return w; };
+            // 수집률은 실제로 수집한 기록만으로
+            const realRuns = [...new Set(raw.filter(inDay).map(r => +r.epoch))].sort((a, b) => a - b);
+            const realW = wOf(realRuns);
+            const coverage = realRuns.reduce((s, t) => s + realW[t], 0) / 86400;
+            // 빈 구간 채우기(2026-11-21): MAX_GAP보다 길고 3시간 이하로 빈 곳에 NOMINAL 간격으로 추정 기록을 넣는다
+            const fill = fillGaps(raw, NOMINAL, MAX_GAP, 3 * 3600);
+            const rows = [...raw, ...fill].filter(inDay);
             const runs = [...new Set(rows.map(r => +r.epoch))].sort((a, b) => a - b);
-            const weight = {};
-            runs.forEach((t, i) => { weight[t] = Math.min((i + 1 < runs.length ? runs[i + 1] : Math.min(end, t + NOMINAL)) - t, MAX_GAP); });
-            const coverage = runs.reduce((s, t) => s + weight[t], 0) / 86400;
+            const weight = wOf(runs);
+            const filledMin = Math.round(fill.filter(inDay).length / Math.max(1, names.length) * NOMINAL / 60);
             // 수집 시작 전 날짜 등 데이터가 거의 없으면 기록을 남기지 않음 (0명으로 잘못 기록되는 것 방지)
             if (coverage < 0.05) return `${dayStr} 건너뜀 · 수집률 ${(coverage * 100).toFixed(1)}% (데이터 부족)`;
 
@@ -254,7 +273,41 @@ jobs:
             io.write(`reports/daily/${dayStr}.html`, html);
             io.write('reports/latest.html', html);
             io.write('reports/history.html', buildHistoryHtml(personHist, totalHist, names));
-            return `${dayStr} 리포트 완료 · 수집률 ${totalRow['수집률(%)']}% · 방송 ${totalRow['방송 인원']}명 · 총 뷰어십 ${comma(totalRow['총 뷰어십'])}`;
+            return `${dayStr} 리포트 완료 · 수집률 ${totalRow['수집률(%)']}% · 빈 구간 ${filledMin}분 채움 · 방송 ${totalRow['방송 인원']}명 · 총 뷰어십 ${comma(totalRow['총 뷰어십'])}`;
+          }
+
+          // 빈 구간 채우기: 앞뒤 실제 기록(a, b)으로 사이 시각의 기록을 만든다
+          //  - 앞뒤 모두 방송 중이고 방송 시작 시각이 같음(같은 방송) → 앞뒤 값 사이 직선
+          //  - 뒤에서 방송 중이고 그 방송이 빈 사이에 시작됨 → 시작 시각부터 뒤 값
+          //  - 그 밖(빈 사이에 방송이 끝났을 수 있음 등) → 채우지 않음(방송 안 함으로 둠)
+          function fillGaps(raw, nominal, maxGap, fillMax) {
+            const byT = new Map();
+            for (const r of raw) { const t = +r.epoch; if (!byT.has(t)) byT.set(t, {}); byT.get(t)[r['이름']] = r; }
+            const ts = [...byT.keys()].sort((a, b) => a - b);
+            const openAt = s => { if (!s) return NaN; const d = new Date(s.replace(' ', 'T')); return d.getTime() / 1000; };
+            const out = [];
+            for (let i = 0; i + 1 < ts.length; i++) {
+              const a = ts[i], b = ts[i + 1], gap = b - a;
+              if (gap <= maxGap || gap > fillMax) continue;
+              const A = byT.get(a), B = byT.get(b);
+              for (let t = a + nominal; t <= b - nominal / 2; t += nominal) {
+                const d = new Date(t * 1000);
+                const stamp = `${ymd(d)} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+                for (const name of Object.keys(B)) {
+                  const ra = A[name], rb = B[name];
+                  let v = null;
+                  if (rb['상태'] === 'OPEN') {
+                    if (ra && ra['상태'] === 'OPEN' && ra['방송시작'] && ra['방송시작'] === rb['방송시작'])
+                      v = Math.round(+ra['동시시청자'] + (+rb['동시시청자'] - +ra['동시시청자']) * (t - a) / gap);
+                    else if (openAt(rb['방송시작']) <= t && openAt(rb['방송시작']) > a) v = +rb['동시시청자'];
+                  }
+                  out.push({ epoch: String(t), '시각': stamp, channelId: rb.channelId, '이름': name,
+                    '상태': v === null ? 'CLOSE' : 'OPEN', '동시시청자': String(v === null ? 0 : v),
+                    '카테고리': v === null ? '' : rb['카테고리'], '방송시작': v === null ? '' : rb['방송시작'], '채움': '1' });
+                }
+              }
+            }
+            return out;
           }
 
           function delta(cur, prev, kind) {
@@ -492,7 +545,14 @@ jobs:
           render();
           </script></body></html>`;
           }
-          console.log(main(io, process.env.REPORT_DATE || '', process.env.SAMPLE_SECONDS));
+          if ((process.env.REPORT_DATE || '').trim() === 'all') {
+            // 지난 날짜 전부 다시 계산(빈 구간 채우기 규칙을 예전 날짜에도 적용). 원본이 있는 날짜 중 어제까지
+            const yest = ymd(addDays(new Date(), -1));
+            const days = fs.readdirSync('data/raw').map(f => f.replace(/\.csv$/, '')).filter(d => /^\d{4}-\d\d-\d\d$/.test(d) && d <= yest).sort();
+            for (const d of days) console.log(main(io, d, process.env.SAMPLE_SECONDS));
+          } else {
+            console.log(main(io, process.env.REPORT_DATE || '', process.env.SAMPLE_SECONDS));
+          }
           JS
 
       - name: 저장
